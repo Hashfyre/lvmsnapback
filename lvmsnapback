@@ -1,0 +1,262 @@
+#!/bin/bash
+
+# Path
+#-------------------------------------------------------------------------------
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Section: 01 - Messages
+#-------------------------------------------------------------------------------
+
+usageGuideMessage(){
+  echo -e "\
+  \n\tUsage:
+  \n\t\tlvmsnapback
+  \n\t\t\t( --logical-volume | -L ) < LVM volume >
+  \n\t\t\t( --remote-host | -H ) < remote host name >"
+  exit $?
+}
+
+badNumParamsError(){
+  echo -e "ERROR 00: Wrong Number of parameters passed!"
+  usageGuideMessage
+}
+
+badLVSwitchError(){
+  echo -e "ERROR 01: Wrong option switch passed in place of ( --logical-volume | -L)!"
+  usageGuideMessage
+}
+
+badHostSwitchError(){
+  echo -e "ERROR 02: Wrong option switch passed in place of ( --remote-host | -H )!"
+  usageGuideMessage
+}
+
+badLVParamError(){
+  echo -e "ERROR 03: Provided logical-volume DOES NOT EXIST on this host."
+  echo -e "ERROR 03: Check your logical-volumes using lvs | lvdisplay"
+  exit $?
+}
+
+badHostParamError(){
+  echo -e "ERROR 04: Provided remote-host is not in this host's /etc/hosts. Aborting."
+  exit $?
+}
+
+missingYamlParserError(){
+   echo -e "ERROR 05: A required Dependency is missing at."
+   echo -e "ERROR 05: Please install yamlparser from git@bitbucket.org:cariq_devops/AzureScripts/yamlparser"
+   exit $?
+}
+
+missingConfFileError(){
+  local conf_file=$1
+  echo -e "ERROR 06: Required configuration file missing at ${conf_file}."
+  echo -e "ERROR 06: Please see README for script installation."
+}
+
+rsyncFailureError(){
+  echo -e "ERROR 07: Something happened during rsync, the local and remote checksums do not match! Aborting."
+  exit $?
+}
+
+# Section: 02 - Validations
+#-------------------------------------------------------------------------------
+
+testNumParams(){
+  local num_params=$1
+
+  if [ "${num_params}" -ne 4 ]
+  then
+    badNumParamsError
+  fi
+}
+
+testLVSwitch(){
+  local lv_switch=$1
+
+  if [ "${lv_switch}" != "--local-volume" ] && [ "${lv_switch}" != "-L" ]
+  then
+    badLVSwitchError
+  fi
+}
+
+testHostSwitch(){
+  local host_switch=$1
+
+  if [ "${host_switch}" != "--remote-host" ] && [ "${host_switch}" != "-H" ]
+  then
+    badHostSwitchError
+  fi
+}
+
+testSwitches(){
+  local lv_switch=$1; shift
+  local remote_host_switch=$1; shift
+
+  testLVSwitch ${lv_switch}
+  testHostSwitch ${remote_host_switch}
+}
+
+testLVParam(){
+  local lv_param=$1
+  local lv_exists=`sudo lvs -S lv_name=${lv_param} | wc -c`
+
+  if [ "${lv_exists}" -eq 0 ]
+  then
+    badLVParamError
+  fi
+}
+
+testHostParam(){
+  local host_param=$1
+  local host_exists=`grep ${host_param} /etc/hosts | wc -l`
+
+  if [ "${host_exists}" -eq 0 ]
+  then
+    badHostParamError
+  fi
+}
+
+testParams(){
+  local lv_param=$1; shift
+  local remote_host_param=$1
+
+  testLVParam ${lv_param}
+  testHostParam ${remote_host_param}
+}
+
+testArgs(){
+  local num_params=$1; shift
+  local lv_switch=$1; shift
+  local lv_param=$1; shift
+  local remote_host_switch=$1; shift
+  local remote_host_param=$1
+
+  testNumParams ${num_params}
+  testSwitches ${lv_switch} ${remote_host_switch}
+  testParams ${lv_param} ${remote_host_param}
+}
+
+# Section: 03 - Configurations
+#-------------------------------------------------------------------------------
+
+readConfigurationRules(){
+	local conf_file=$1
+	if [ ! -e ${conf_file} ]
+	then
+		missingConfFileError ${conf_file}
+	else
+    if [ ! -e "/usr/local/bin/yamlparser" ]
+    then
+      missingYamlParserError
+    else
+      eval "$(yamlparser ${conf_file})"
+    fi
+	fi
+}
+
+# Section: 02 - Core Functions
+#-------------------------------------------------------------------------------
+takeSnapshot(){
+  local lv_param=$1
+  sudo lvcreate -L "${config_snapshot_size_in_GB}G" -s -n ${snap_volume} /dev/${vol_group}/${lv_param}
+}
+
+mountSnapshot(){
+  sudo mkdir -p ${snapshot_root}
+  sudo mount /dev/${vol_group}/${snap_volume} ${snapshot_root}
+}
+
+ownNewSnapshotFS(){
+  sudo chown -R ${rsync_user}.${rsync_user} ${snapshot_root}
+}
+
+ownRemoteBackupRoot(){
+  local remote_host=$1
+  ${ssh_cmd} "sudo chown -R ${rsync_user}.${rsync_user} ${remote_backup_root}"
+}
+
+tempBackupRemoteOldbackup(){
+  local remote_host=$1
+  local check_remote_today_empty=`${ssh_cmd} "sudo ls -l ${remote_backup_root}/${today}/"`
+  if [ "${check_remote_today_empty}" != "total 0" ]
+  then
+    ${ssh_cmd} "sudo cp -al ${remote_backup_root}/${today}/ ${remote_backup_root}/${today}.old/"
+  fi
+}
+
+rotateRemoteDirHardLinks(){
+  local remote_host=$1
+
+  local check_remote_yesterday_empty=`${ssh_cmd} "sudo ls -l ${remote_backup_root}/${yesterday}/"`
+  if [ "${check_remote_yesterday_empty}" != "total 0" ]
+  then
+    ${ssh_cmd} "sudo cp -al ${remote_backup_root}/${yesterday} ${remote_backup_root}/${today}"
+  fi
+}
+
+rsyncSnapFS(){
+  local remote_host=$1
+  sudo touch ${log_file}
+  sudo chown -R ${rsync_user}.${rsync_user} ${log_file}
+  rsync -avP --delete -e "ssh -i ${rsync_user_key}" ${snapshot_root}/ ${rsync_user}@${remote_host}:${remote_backup_root}/${today}/. > ${log_file} 2>&1
+}
+
+createRemoteSymLink(){
+  local remote_host=$1
+  remote_link_command="\
+  if [ ! -L ${remote_backup_root}/latest ]; then\
+  sudo ln -sf ${remote_backup_root}/${today} ${remote_backup_root}/latest;\
+  else\
+  sudo rm -f ${remote_backup_root}/latest;\
+  sudo ln -sf ${remote_backup_root}/${today} ${remote_backup_root}/latest;\
+  fi;"
+  ${ssh_cmd} "${remote_link_command}"
+}
+
+removeTempBackupRemoteOldbackup(){
+  local remote_host=$1
+  ${ssh_cmd} "sudo rm -rf ${remote_backup_root}/${today}.old"
+}
+
+unmountSnaphot(){
+  sudo umount ${snapshot_root}
+}
+
+removeSnapshot(){
+  sudo lvremove --force /dev/${vol_group}/${snap_volume}
+}
+
+doLVMSnapshotBackup(){
+  local lv_param=$1; shift
+  local remote_host=$1
+
+  takeSnapshot ${lv_param}
+  mountSnapshot
+  ownNewSnapshotFS
+  ownRemoteBackupRoot ${remote_host}
+  rotateRemoteDirHardLinks ${remote_host}
+  rsyncSnapFS ${remote_host}
+  createRemoteSymLink ${remote_host}
+  unmountSnaphot
+  removeSnapshot
+}
+
+# Main
+#-------------------------------------------------------------------------------
+main(){
+  local num_params=$#
+  local lv_switch=$1; shift
+  local lv_param=$1; shift
+  local remote_host_switch=$1; shift
+  local remote_host_param=$1
+  local conf_file=${0##*/}.conf
+  local conf_path="/etc/${0##*/}"
+
+  readConfigurationRules ${conf_path}/${conf_file}
+  testArgs ${num_params} ${lv_switch} ${lv_param} ${remote_host_switch} ${remote_host_param}
+  doLVMSnapshotBackup ${lv_param} ${remote_host_param}
+}
+
+main "$@"
